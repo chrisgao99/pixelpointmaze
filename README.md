@@ -1,6 +1,6 @@
 # pixelpointmaze
 
-A research project for training a pixel-based RL agent on procedurally-generated mazes, probing its internal representations, and enabling real-time human intervention via feature-space manipulation.
+This repo provides code to train a pixel-based SAC agent on PointMaze, probe its CNN features to check if they encode wall positions, and run an interactive demo where a human can steer the agent at runtime by manipulating its internal features with arrow keys.
 
 ---
 
@@ -14,7 +14,7 @@ Key components:
 - **`generate_single_random_maze()`** — Procedurally generates connected 8×8 mazes with exactly 9 inner walls.
 - **`DUMMY_9_WALL_MAP`** — A fixed template maze required so MuJoCo compiles the right number of movable wall blocks at startup.
 - **`DynamicAlignedPixelWrapper`** — A `gym.ObservationWrapper` that replaces the default state observation with a top-down 64×64 RGB render. On each episode reset, it re-randomizes the maze layout by physically repositioning MuJoCo wall geoms.
-- **`CustomCombinedExtractor`** — A CNN-based feature extractor for dict observations: processes the 64×64 image through two conv layers down to an 8×8 spatial feature map (64 channels), and flattens the goal vectors separately.
+- **`CustomCombinedExtractor`** — A CNN-based feature extractor for dict observations: processes the 64×64 image through two deliberately sized conv layers (4×4 stride-4, then 2×2 stride-2) that reduce the spatial dimensions to exactly 8×8 with 64 channels. This is intentional — the 8×8 feature map has a one-to-one spatial correspondence with the 8×8 maze grid, so each CNN cell encodes exactly one maze block. Goal vectors are flattened separately.
 - The main script trains with 10 parallel environments, 4-frame stacking, for 3M timesteps. Checkpoints and the best model are saved under `logs/`.
 
 ### 2. `test.py` — Evaluate and inspect the trained model
