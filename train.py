@@ -222,7 +222,7 @@ if __name__ == "__main__":
     print(f"Using CustomCombinedExtractor (64x64 -> 8x8) and Dynamic Random Maps")
 
     # --- Setup Training Envs ---
-    env_fns = [make_wrapped_env(env_id, seed=i) for i in range(num_envs)]
+    env_fns = [make_wrapped_env(env_id, seed=i, log_dir=log_dir) for i in range(num_envs)]
     vec_env = SubprocVecEnv(env_fns)
     vec_env = VecFrameStack(vec_env, n_stack=4, channels_order='last')
     vec_env = VecTransposeImage(vec_env) 
