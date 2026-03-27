@@ -16,13 +16,25 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 # ==========================================
 # 0. Random Maze Generator & Dummy Map
 # ==========================================
+# Use this exact dummy map
+DUMMY_FULL_MAP = [
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, 0, 1, 1, 1, 1, 1, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+]
+
 def generate_single_random_maze():
-    """Generates a single valid 8x8 maze with exactly 9 inner walls."""
     while True:
         maze = np.ones((8, 8), dtype=int)
         maze[1:-1, 1:-1] = 0  
         
-        inner_indices = [(r, c) for r in range(1, 7) for c in range(1, 7)]
+        # Exclude (1,1) so it perfectly matches the dummy map
+        inner_indices = [(r, c) for r in range(1, 7) for c in range(1, 7) if (r, c) != (1, 1)]
         wall_indices = random.sample(inner_indices, 9)
         for r, c in wall_indices:
             maze[r, c] = 1
@@ -45,19 +57,6 @@ def generate_single_random_maze():
                     
         if len(visited) == 27:
             return maze.tolist()
-
-# REQUIRED: MuJoCo must compile with exactly 9 inner blocks so we can shift them later.
-DUMMY_9_WALL_MAP = [
-    [1, 1, 1, 1, 1, 1, 1, 1],
-    [1, 0, 0, 0, 0, 0, 0, 1],
-    [1, 0, 1, 1, 1, 0, 0, 1],
-    [1, 0, 1, 1, 1, 0, 0, 1],
-    [1, 0, 1, 1, 1, 0, 0, 1],
-    [1, 0, 0, 0, 0, 0, 0, 1],
-    [1, 0, 0, 0, 0, 0, 0, 1],
-    [1, 1, 1, 1, 1, 1, 1, 1],
-]
-
 # ==========================================
 # 1. Custom Combined Extractor
 # ==========================================
@@ -144,23 +143,33 @@ class DynamicAlignedPixelWrapper(gym.ObservationWrapper):
         model = self.env.unwrapped.model
         maze_obj._maze_map = np.array(new_maze)
         
-        # 2. Find and shift inner MuJoCo blocks
+        # 2. Get all inner blocks
         geom_names = [model.names[model.name_geomadr[i]:].split(b'\x00')[0].decode('utf-8') for i in range(model.ngeom)]
         block_geoms = [name for name in geom_names if name.startswith("block_")]
         inner_block_geoms = [name for name in block_geoms if not (name.startswith("block_0_") or name.startswith("block_7_") or name.endswith("_0") or name.endswith("_7"))]
         
-        new_walls = [(i, j) for i in range(1, 7) for j in range(1, 7) if new_maze[i][j] == 1]
-        
-        if len(inner_block_geoms) == len(new_walls):
-            for k, geom_name in enumerate(inner_block_geoms):
-                geom_id = model.geom(geom_name).id
-                i, j = new_walls[k]
-                x = (j + 0.5) * maze_obj.maze_size_scaling - maze_obj.x_map_center
-                y = maze_obj.y_map_center - (i + 0.5) * maze_obj.maze_size_scaling
-                model.geom_pos[geom_id][0] = x
-                model.geom_pos[geom_id][1] = y
+        # 3. THE GHOST PROTOCOL: Toggle visibility and collision
+        for geom_name in inner_block_geoms:
+            geom_id = model.geom(geom_name).id
+            
+            # Math to figure out exactly which grid cell this block is sitting on
+            x = model.geom_pos[geom_id][0]
+            y = model.geom_pos[geom_id][1]
+            j = int(round((x + maze_obj.x_map_center) / maze_obj.maze_size_scaling - 0.5))
+            i = int(round((maze_obj.y_map_center - y) / maze_obj.maze_size_scaling - 0.5))
+            
+            if new_maze[i][j] == 1:
+                # WALL SHOULD EXIST: Bring to surface and make solid
+                model.geom_pos[geom_id][2] = 0.0     
+                model.geom_contype[geom_id] = 1      
+                model.geom_conaffinity[geom_id] = 1  
+            else:
+                # WALL SHOULD NOT EXIST: Bury underground and turn off collision
+                model.geom_pos[geom_id][2] = -10.0   
+                model.geom_contype[geom_id] = 0      
+                model.geom_conaffinity[geom_id] = 0  
                 
-        # 3. Update valid spawn locations
+        # 4. Update valid spawn locations
         empty_locations = []
         for i in range(maze_obj.map_length):
             for j in range(maze_obj.map_width):
@@ -175,6 +184,7 @@ class DynamicAlignedPixelWrapper(gym.ObservationWrapper):
         
         obs, info = self.env.reset(**kwargs)
         return self.observation(obs), info
+                
 
     def compute_reward(self, achieved_goal, desired_goal, info):
         # HER FIX: VecFrameStack concatenates goals (e.g., shape becomes 8 instead of 2). 
@@ -195,7 +205,7 @@ class DynamicAlignedPixelWrapper(gym.ObservationWrapper):
 def make_wrapped_env(env_id, seed=0, log_dir=None):
     def _init():
         # Inject the dummy map here so MuJoCo compiles the correct number of blocks!
-        env = gym.make(env_id, render_mode="rgb_array", maze_map=DUMMY_9_WALL_MAP)
+        env = gym.make(env_id, render_mode="rgb_array", maze_map=DUMMY_FULL_MAP)
         env = DynamicAlignedPixelWrapper(env)
         if log_dir:
             env = Monitor(env, log_dir)
