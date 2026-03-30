@@ -21,7 +21,7 @@ env_id = "PointMaze_Medium-v3"
 save_name = "sac_pixelpm_aligned_64_dynamic"  # Update this to match your model's name
 model_path = f"./logs/{save_name}/best_model.zip" 
 video_folder = f"./logs/{save_name}/test_videos"
-num_test_episodes = 10
+num_test_episodes = 50
 
 # ==========================================
 # 2. Evaluation Environment Setup

@@ -209,3 +209,5 @@ __marimo__/
 
 *.out
 /logs
+*.npz
+*.png

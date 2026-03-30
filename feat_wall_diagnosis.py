@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 # 1. Load Data
-data = np.load("maze_probing_data.npz")
+data = np.load("maze_probing_data_labeled.npz")
 features = data['features']   # Shape: (Episodes, Steps, 64, 8, 8)
 maze_map = data['maze_map']   # Shape: (8, 8)
 

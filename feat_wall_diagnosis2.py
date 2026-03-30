@@ -4,7 +4,7 @@ import seaborn as sns
 from sklearn.linear_model import LogisticRegression
 
 # 1. Load Data
-data = np.load("maze_probing_data.npz")
+data = np.load("maze_probing_data_labeled.npz")
 features = data['features']   # (Episodes, Steps, 64, 8, 8)
 maze_map = data['maze_map']   # (8, 8)
 
