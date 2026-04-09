@@ -27,29 +27,16 @@ eval_env = DummyVecEnv([make_env])
 eval_env = VecFrameStack(eval_env, n_stack=4, channels_order='last')
 eval_env = VecTransposeImage(eval_env)
 
-# Get the base environment to access Ground Truth positions
+# Get the base environment
 base_env = eval_env.envs[0].unwrapped
-maze_array = np.array(base_env.maze.maze_map)
 
-print(f"Maze Map: {maze_array}")
-breakpoint()
-# --- Helper: Convert Continuous XY to Grid Indices ---
 def get_agent_grid_pos(env):
-    """
-    Retrieves the agent's (x, y) and converts it to (row, col) indices.
-    """
-    # 1. Get continuous position (MuJoCo specific)
-    # 'data.qpos' is standard for MuJoCo envs. 
-    # Check if your specific env uses 'env.point.pos' instead.
+    """Retrieves the agent's (x, y) and converts it to (row, col) indices."""
     if hasattr(env, 'point'):
         x, y = env.point.pos[:2]
     else:
         x, y = env.data.qpos[:2]
-
-    # 2. Convert to Grid Indices using the Maze utility
-    # Gymnasium Robotics Maze objects usually have this helper method
     row, col = env.maze.cell_xy_to_rowcol([x, y])
-    # print(f"Agent Continuous Pos: ({x:.2f}, {y:.2f}) -> Grid Pos: (Row: {row}, Col: {col})")
     return np.array([row, col])
 
 # Load Model
@@ -61,13 +48,17 @@ handle = target_layer.register_forward_hook(hook_fn)
 
 # --- 3. Data Collection Loop ---
 all_episode_features = []
-all_current_pos = []  # Stores (row, col) before step
-all_next_pos = []     # Stores (row, col) after step
+all_current_pos = []  
+all_next_pos = []     
+all_maze_maps = []    # NEW: Store the dynamic maps per episode
 
-print(f"Collecting data for 10 episodes (100 steps each)...")
+print(f"Collecting data for 100 episodes (up to 100 steps each)...")
 
 for ep in range(100):
     obs = eval_env.reset()
+    
+    # --- THE FIX: Grab the map FOR THIS SPECIFIC EPISODE ---
+    current_maze_map = np.array(base_env.maze.maze_map)
     
     ep_features = []
     ep_curr_pos = []
@@ -76,8 +67,7 @@ for ep in range(100):
     for step in range(100):
         features_storage.clear()
         
-        # 1. Record CURRENT Position (Before moving)
-        # We must use base_env because 'obs' is just pixels
+        # 1. Record CURRENT Position
         curr_grid = get_agent_grid_pos(base_env)
         ep_curr_pos.append(curr_grid)
         
@@ -85,7 +75,7 @@ for ep in range(100):
         action, _ = model.predict(obs, deterministic=True)
         obs, _, dones, _ = eval_env.step(action)
         
-        # 3. Record NEXT Position (After moving)
+        # 3. Record NEXT Position
         next_grid = get_agent_grid_pos(base_env)
         ep_next_pos.append(next_grid)
         
@@ -101,31 +91,37 @@ for ep in range(100):
     all_current_pos.append(np.array(ep_curr_pos))
     all_next_pos.append(np.array(ep_next_pos))
     
+    # --- THE FIX: Tile the map to match the number of steps in this episode ---
+    all_maze_maps.append(np.tile(current_maze_map, (len(ep_features), 1, 1)))
+    
     print(f"Finished Episode {ep+1}, steps: {len(ep_features)}")
 
 # Cleanup
 handle.remove()
 
 # --- 4. Formatting Data ---
-# Convert lists to arrays
-final_features = np.array(all_episode_features) # (Episodes, Steps, 64, 8, 8)
-final_curr_pos = np.array(all_current_pos)      # (Episodes, Steps, 2)
-final_next_pos = np.array(all_next_pos)         # (Episodes, Steps, 2)
+# Since episodes might end early (dones[0] == True), we use np.concatenate 
+# to flatten everything into a single timeline instead of a strict 3D array.
+final_features = np.concatenate(all_episode_features, axis=0) # (Total_Steps, 64, 8, 8)
+final_curr_pos = np.concatenate(all_current_pos, axis=0)      # (Total_Steps, 2)
+final_next_pos = np.concatenate(all_next_pos, axis=0)         # (Total_Steps, 2)
+final_maze_maps = np.concatenate(all_maze_maps, axis=0)       # (Total_Steps, 8, 8)
 
 print("\n" + "="*30)
 print(f"Collection Complete!")
-print(f"Features Shape: {final_features.shape}")
-print(f"Current Pos Labels Shape: {final_curr_pos.shape}") # e.g. (10, 100, 2)
-print(f"Next Pos Labels Shape:    {final_next_pos.shape}")
+print(f"Features Shape:    {final_features.shape}")
+print(f"Maze Map Shape:    {final_maze_maps.shape}")
+print(f"Current Pos Shape: {final_curr_pos.shape}") 
+print(f"Next Pos Shape:    {final_next_pos.shape}")
 print("="*30)
 
 # --- 5. Saving Data ---
 save_path = "maze_probing_data_labeled.npz"
 np.savez(save_path, 
-         features=final_features,   # The CNN activations
-         maze_map=maze_array,       # The static Wall/Path map
-         agent_pos_curr=final_curr_pos, # Label: Where agent IS
-         agent_pos_next=final_next_pos  # Label: Where agent IS GOING
+         features=final_features,   
+         maze_map=final_maze_maps,      # Now properly synced with the features
+         agent_pos_curr=final_curr_pos, 
+         agent_pos_next=final_next_pos  
          )
 
 print(f"Data saved to {save_path}")
