@@ -9,14 +9,13 @@ import mujoco
 
 from stable_baselines3 import SAC, HerReplayBuffer
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback, CallbackList
-from stable_baselines3.common.vec_env import SubprocVecEnv, VecFrameStack, VecTransposeImage, DummyVecEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 # ==========================================
 # 0. Random Maze Generator & Dummy Map
 # ==========================================
-# Use this exact dummy map
 DUMMY_FULL_MAP = [
     [1, 1, 1, 1, 1, 1, 1, 1],
     [1, 0, 1, 1, 1, 1, 1, 1],
@@ -33,7 +32,6 @@ def generate_single_random_maze():
         maze = np.ones((8, 8), dtype=int)
         maze[1:-1, 1:-1] = 0  
         
-        # Exclude (1,1) so it perfectly matches the dummy map
         inner_indices = [(r, c) for r in range(1, 7) for c in range(1, 7) if (r, c) != (1, 1)]
         wall_indices = random.sample(inner_indices, 9)
         for r, c in wall_indices:
@@ -57,14 +55,14 @@ def generate_single_random_maze():
                     
         if len(visited) == 27:
             return maze.tolist()
+
 # ==========================================
-# 1. Custom Combined Extractor
+# 1. Custom Combined Extractor (Simplified for Matrix)
 # ==========================================
 class CustomCombinedExtractor(BaseFeaturesExtractor):
     """
-    Custom Extractor for Dict observations.
-    - 'observation': Processed by AlignedMazeCNN (64x64 -> 8x8)
-    - 'achieved_goal' & 'desired_goal': Flattened
+    因为我们将图片换成了 8x8 的矩阵，不再需要 CNN。
+    直接将全部输入展平 (Flatten) 拼接后交给 SAC 的全连接层 (MLP) 处理。
     """
     def __init__(self, observation_space: gym.spaces.Dict, features_dim: int = 256):
         super().__init__(observation_space, features_dim=1)
@@ -73,25 +71,8 @@ class CustomCombinedExtractor(BaseFeaturesExtractor):
         total_concat_size = 0
         
         for key, subspace in observation_space.spaces.items():
-            if key == "observation":
-                n_input_channels = subspace.shape[0]
-                cnn = nn.Sequential(
-                    nn.Conv2d(n_input_channels, 32, kernel_size=4, stride=4, padding=0),
-                    nn.ReLU(),
-                    nn.Conv2d(32, 64, kernel_size=2, stride=2, padding=0),
-                    nn.ReLU(),
-                    nn.Flatten(),
-                )
-                extractors[key] = cnn
-                
-                with torch.no_grad():
-                    sample = torch.zeros(1, *subspace.shape)
-                    cnn_out = cnn(sample).shape[1]
-                total_concat_size += cnn_out
-                
-            else:
-                extractors[key] = nn.Flatten()
-                total_concat_size += np.prod(subspace.shape)
+            extractors[key] = nn.Flatten()
+            total_concat_size += np.prod(subspace.shape)
         
         self.extractors = nn.ModuleDict(extractors)
         self._features_dim = total_concat_size
@@ -103,56 +84,43 @@ class CustomCombinedExtractor(BaseFeaturesExtractor):
         return torch.cat(encoded_tensor_list, dim=1)
 
 # ==========================================
-# 2. Dynamic Pixel Wrapper (HER + Map Fixes)
+# 2. Dynamic Wall Matrix Wrapper 
 # ==========================================
-class DynamicAlignedPixelWrapper(gym.ObservationWrapper):
+class DynamicWallMatrixWrapper(gym.ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)
         self.model = env.unwrapped.model
         self.data = env.unwrapped.data
         
-        self.img_size = 64 
-        self.renderer = mujoco.Renderer(self.model, height=self.img_size, width=self.img_size)
-        
-        self.camera = mujoco.MjvCamera()
-        mujoco.mjv_defaultCamera(self.camera)
-        self.camera.lookat = [0, 0, -10.0] 
-        self.camera.distance = 20.0 
-        self.camera.elevation = -90
-        self.camera.azimuth = 90 
-        
+        # 将 observation 空间替换为 8x8 的矩阵 (值范围 0~1)
         new_spaces = env.observation_space.spaces.copy()
         new_spaces['observation'] = gym.spaces.Box(
-            low=0, high=255, shape=(self.img_size, self.img_size, 3), dtype=np.uint8
+            low=0, high=1, shape=(8, 8), dtype=np.float32
         )
         self.observation_space = gym.spaces.Dict(new_spaces)
         
-        # Track solid walls for collision detection
         self.solid_wall_geom_ids = set()
+        self.current_maze_matrix = np.zeros((8, 8), dtype=np.float32)
 
     def observation(self, obs):
-        self.renderer.update_scene(self.data, camera=self.camera)
-        pixels = self.renderer.render()
-        self._last_obs = pixels
-        
         new_obs = obs.copy()
-        new_obs['observation'] = pixels
+        # 替换原有的 observation 为当前地图的 8x8 墙壁矩阵
+        new_obs['observation'] = self.current_maze_matrix.copy()
         return new_obs
         
     def reset(self, **kwargs):
-        # 1. Generate new map & update internal array
         new_maze = generate_single_random_maze()
+        self.current_maze_matrix = np.array(new_maze, dtype=np.float32)
+        
         maze_obj = self.env.unwrapped.maze
         model = self.env.unwrapped.model
-        maze_obj._maze_map = np.array(new_maze)
+        maze_obj._maze_map = self.current_maze_matrix
         
         self.solid_wall_geom_ids.clear()
         
-        # 2. Get all block geoms
         geom_names = [model.names[model.name_geomadr[i]:].split(b'\x00')[0].decode('utf-8') for i in range(model.ngeom)]
         block_geoms = [name for name in geom_names if name.startswith("block_")]
         
-        # 3. Toggle visibility, collision, and track solid walls
         for geom_name in block_geoms:
             geom_id = model.geom(geom_name).id
             is_inner = not (geom_name.startswith("block_0_") or geom_name.startswith("block_7_") or geom_name.endswith("_0") or geom_name.endswith("_7"))
@@ -164,21 +132,17 @@ class DynamicAlignedPixelWrapper(gym.ObservationWrapper):
                 i = int(round((maze_obj.y_map_center - y) / maze_obj.maze_size_scaling - 0.5))
                 
                 if new_maze[i][j] == 1:
-                    # WALL SHOULD EXIST
                     model.geom_pos[geom_id][2] = 0.0     
                     model.geom_contype[geom_id] = 1      
                     model.geom_conaffinity[geom_id] = 1  
                     self.solid_wall_geom_ids.add(geom_id)
                 else:
-                    # WALL SHOULD NOT EXIST
                     model.geom_pos[geom_id][2] = -10.0   
                     model.geom_contype[geom_id] = 0      
                     model.geom_conaffinity[geom_id] = 0  
             else:
-                # Outer boundaries are always solid
                 self.solid_wall_geom_ids.add(geom_id)
                 
-        # 4. Separate empty locations and wall locations for Line-of-Sight checking
         empty_locations = []
         wall_locations = []
         for i in range(maze_obj.map_length):
@@ -190,7 +154,6 @@ class DynamicAlignedPixelWrapper(gym.ObservationWrapper):
                 else:
                     wall_locations.append(np.array([x, y]))
                     
-        # Helper function: Calculate shortest distance from a point to a line segment
         def point_to_segment_dist(w, a, b):
             ab = b - a
             l2 = np.sum(ab**2)
@@ -201,7 +164,6 @@ class DynamicAlignedPixelWrapper(gym.ObservationWrapper):
             proj = a + t * ab
             return np.linalg.norm(w - proj)
 
-        # 5. Loop until we sample a pair that forces the agent to bypass a wall
         threshold = maze_obj.maze_size_scaling * 0.45 
         while True:
             start_idx = random.randint(0, len(empty_locations) - 1)
@@ -222,7 +184,6 @@ class DynamicAlignedPixelWrapper(gym.ObservationWrapper):
             if intersect:
                 break 
                 
-        # 6. Force the environment to use these exact locations
         maze_obj._unique_reset_locations = [start_pos]
         maze_obj._unique_goal_locations = [goal_pos]
         maze_obj._combined_locations = [start_pos, goal_pos]
@@ -231,21 +192,17 @@ class DynamicAlignedPixelWrapper(gym.ObservationWrapper):
         return self.observation(obs), info
         
     def step(self, action):
-        # Take the standard step
         obs, reward, terminated, truncated, info = self.env.step(action)
         
-        # Collision detection via MuJoCo physics engine
         touching_wall = False
         for i in range(self.data.ncon):
             contact = self.data.contact[i]
-            # Check if either of the colliding geometries is a solid wall
             if contact.geom1 in self.solid_wall_geom_ids or contact.geom2 in self.solid_wall_geom_ids:
                 touching_wall = True
                 break
                 
-        # Apply the penalty
         if touching_wall:
-            reward -= 2  # Tweak this value if it's too aggressive or too weak
+            reward -= 0.4  
             
         return self.observation(obs), reward, terminated, truncated, info
                 
@@ -255,19 +212,10 @@ class DynamicAlignedPixelWrapper(gym.ObservationWrapper):
             desired_goal = desired_goal[..., -2:]
         return self.env.unwrapped.compute_reward(achieved_goal, desired_goal, info)
 
-    def close(self):
-        if hasattr(self, 'renderer'):
-            self.renderer.close()
-        super().close()
-        
-    def render(self):
-        return self._last_obs
-        
 def make_wrapped_env(env_id, seed=0, log_dir=None):
     def _init():
-        # Inject the dummy map here so MuJoCo compiles the correct number of blocks!
-        env = gym.make(env_id, render_mode="rgb_array", maze_map=DUMMY_FULL_MAP)
-        env = DynamicAlignedPixelWrapper(env)
+        env = gym.make(env_id, maze_map=DUMMY_FULL_MAP)
+        env = DynamicWallMatrixWrapper(env)
         if log_dir:
             env = Monitor(env, log_dir)
         return env
@@ -279,7 +227,7 @@ def make_wrapped_env(env_id, seed=0, log_dir=None):
 if __name__ == "__main__":
     env_id = "PointMaze_Medium-v3"
     num_envs = 10  
-    save_name = "sac_pixelpm_64_forced_bypass_touch_penalty2"  # Update this to match your model's name
+    save_name = "sac_matrixpm_forced_bypass_touch_penalty04"
     
     log_dir = f"logs/tb/{save_name}"
     eval_log_dir = f"./logs/{save_name}"
@@ -290,18 +238,15 @@ if __name__ == "__main__":
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     print(f"Training {save_name} with {num_envs} environments...")
-    print(f"Using CustomCombinedExtractor (64x64 -> 8x8) and Dynamic Random Maps")
+    print(f"Using Matrix Observation (8x8 -> Flat) and Dynamic Random Maps")
 
     # --- Setup Training Envs ---
     env_fns = [make_wrapped_env(env_id, seed=i, log_dir=log_dir) for i in range(num_envs)]
     vec_env = SubprocVecEnv(env_fns)
-    vec_env = VecFrameStack(vec_env, n_stack=4, channels_order='last')
-    vec_env = VecTransposeImage(vec_env) 
-
+    # 移除 VecFrameStack 和 VecTransposeImage，因为处理的是静态矩阵而非动态像素
+    
     # --- Setup Eval Env ---
     eval_env = DummyVecEnv([make_wrapped_env(env_id, log_dir=eval_log_dir)])
-    eval_env = VecFrameStack(eval_env, n_stack=4, channels_order='last')
-    eval_env = VecTransposeImage(eval_env)
 
     # --- Callbacks ---
     eval_callback = EvalCallback(
@@ -335,7 +280,6 @@ if __name__ == "__main__":
         },
         verbose=1,
         learning_rate=3e-4,
-        # RAM FIX: if OOM crash, reduce buffer_size.
         buffer_size=1_000_000, 
         batch_size=256,
         gamma=0.98,
@@ -355,6 +299,7 @@ if __name__ == "__main__":
     print("\nPolicy Architecture:")
     print(model.policy)
     print("-" * 30)
+    
     
     print("Starting training loop...")
     model.learn(total_timesteps=3e6, callback=callback, log_interval=4)
